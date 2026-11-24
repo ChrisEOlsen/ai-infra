@@ -1,0 +1,47 @@
+{$SITE_ADDRESS} {
+ encode gzip
+ header {
+  X-Content-Type-Options nosniff
+  Referrer-Policy same-origin
+  -Server
+ }
+ @identity path /auth/*
+ # Preserve Keycloak’s own SAMEORIGIN policy: its console needs same-origin login-check frames.
+ handle @identity {
+  reverse_proxy keycloak:8080
+ }
+ @backend path /api/* /oauth2/* /login/* /logout /v1/* /props /tools /slots /chat/v1/* /chat/props /chat/tools /chat/slots /chat/session.js
+ handle @backend {
+  header X-Frame-Options DENY
+  header Cache-Control "no-store"
+  reverse_proxy backend:8080 {
+   flush_interval -1
+  }
+ }
+ handle {
+  header X-Frame-Options DENY
+  forward_auth backend:8080 {
+   uri /api/me
+   @unauth status 401
+   handle_response @unauth {
+    redir * /oauth2/authorization/keycloak 302
+   }
+  }
+  header Cache-Control "no-store"
+  # The upstream chat bundle uses inline scripts; restrict connections to our backend.
+  header Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'wasm-unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self' data:; connect-src 'self'; worker-src 'self' blob:; frame-ancestors 'none'; object-src 'none'; base-uri 'self'"
+  handle_path /admin/* {
+   root * /srv/admin
+   try_files {path} /index.html
+   file_server
+  }
+  handle_path /chat/* {
+   root * /srv/chat
+   try_files {path} /index.html
+   file_server
+  }
+  handle {
+   redir * /chat/ 302
+  }
+ }
+}

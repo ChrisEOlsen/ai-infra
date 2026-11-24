@@ -1,0 +1,31 @@
+logging { level = "warn" }
+otelcol.auth.basic "cloud" {
+ username = sys.env("GRAFANA_INSTANCE_ID")
+ password = sys.env("GRAFANA_TOKEN")
+}
+otelcol.receiver.otlp "app" {
+ grpc { endpoint = "0.0.0.0:4317" }
+ http { endpoint = "0.0.0.0:4318" }
+ output {
+  metrics = [otelcol.processor.batch.app.input]
+  traces = [otelcol.processor.batch.app.input]
+  logs = [otelcol.processor.batch.app.input]
+ }
+}
+otelcol.processor.batch "app" {
+ timeout = "5s"
+ send_batch_size = 256
+ output {
+  metrics = [otelcol.exporter.otlphttp.cloud.input]
+  traces = [otelcol.exporter.otlphttp.cloud.input]
+  logs = [otelcol.exporter.otlphttp.cloud.input]
+ }
+}
+otelcol.exporter.otlphttp "cloud" {
+ client {
+  endpoint = sys.env("GRAFANA_OTLP_ENDPOINT")
+  auth = otelcol.auth.basic.cloud.handler
+ }
+ sending_queue { queue_size = 256 }
+ retry_on_failure { max_elapsed_time = "60s" }
+}

@@ -1,0 +1,3 @@
+employee_id,email,roles,active
+E100,alice@example.com,"employee,finance",true
+E101,bob@example.com,employee,true

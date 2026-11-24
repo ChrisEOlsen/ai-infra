@@ -1,0 +1,38 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+cd /opt/company-rag
+exec 9>/var/lock/company-rag-backup.lock
+flock -n 9 || { echo 'A backup/restore is already active'; exit 1; }
+compose=(docker compose --env-file .env -f deploy/compose.yml)
+work=$(mktemp -d)
+cleanup() {
+ status=$?
+ set +e
+ for db in rag keycloak; do "${compose[@]}" exec -T postgres dropdb -U postgres --if-exists "verify_$db" >/dev/null 2>&1; done
+ rm -rf "$work"
+ "${compose[@]}" start keycloak backend >/dev/null
+ return "$status"
+}
+trap cleanup EXIT
+"${compose[@]}" stop --timeout 150 backend keycloak
+for db in rag keycloak; do
+ "${compose[@]}" exec -T postgres pg_dump -U postgres -Fc "$db" > "$work/$db.dump"
+ "${compose[@]}" exec -T postgres pg_restore --list < "$work/$db.dump" >/dev/null
+ # Verify the actual dump can restore, not just that a file exists.
+ "${compose[@]}" exec -T postgres dropdb -U postgres --if-exists "verify_$db" >/dev/null
+ "${compose[@]}" exec -T postgres createdb -U postgres "verify_$db"
+ "${compose[@]}" exec -T postgres pg_restore -U postgres --no-owner -d "verify_$db" < "$work/$db.dump"
+ "${compose[@]}" exec -T postgres dropdb -U postgres "verify_$db"
+done
+root=$(python3 -c 'import json;print(json.load(open("deployment.json"))["environment"]["DATA_ROOT"])')
+tar -czf "$work/documents.tar.gz" -C "$root" documents
+gzip -t "$work/documents.tar.gz"
+(cd "$work" && sha256sum rag.dump keycloak.dump documents.tar.gz > SHA256SUMS)
+archive="$work/backup.tar.gz"
+tar -czf "$archive" -C "$work" rag.dump keycloak.dump documents.tar.gz SHA256SUMS
+bucket=$(python3 -c 'import json;print(json.load(open("deployment.json"))["bucket"])')
+key="backups/$(date -u +%Y%m%dT%H%M%SZ).tar.gz"
+aws s3 cp "$archive" "s3://$bucket/$key" --only-show-errors
+aws s3api head-object --bucket "$bucket" --key "$key" --query ContentLength --output text >/dev/null
+printf 'Verified backup: s3://%s/%s\n' "$bucket" "$key"

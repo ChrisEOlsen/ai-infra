@@ -1,0 +1,17 @@
+.env
+*.tfstate*
+*.tfplan
+.terraform/
+*.tfvars
+!*.tfvars.example
+backend/target/
+admin/node_modules/
+admin/dist/
+admin/.angular/
+chat/.cache/
+chat/dist/
+.runtime/
+__pycache__/
+reports/
+
+deployment.json

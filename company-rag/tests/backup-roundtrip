@@ -1,0 +1,19 @@
+#!/bin/bash
+# Stops the LOCAL mock application briefly; never contacts AWS.
+set -euo pipefail
+cd "$(dirname "$0")/.."
+[ "${1:-}" = --confirm-local-test ] || { echo 'Pass --confirm-local-test; this restores the local development database from its own backup.'; exit 2; }
+root="$PWD"
+mkdir -p .runtime/backup-test
+python3 - <<'PY'
+import pathlib,json
+root=pathlib.Path.cwd();data=dict(line.split('=',1)for line in (root/'.env').read_text().splitlines()if '='in line)
+(root/'.runtime/backup-config.json').write_text(json.dumps({'bucket':'offline-owned-bucket','environment':{'DATA_ROOT':data['DATA_ROOT']}}))
+PY
+docker build -q -t company-rag-backup-test -f tests/backup-tools.Dockerfile tests >/dev/null
+args=(--rm -v /var/run/docker.sock:/var/run/docker.sock -v "$root:/opt/company-rag" -v "$root/.runtime/backup-config.json:/opt/company-rag/deployment.json:ro" -v "$root/.runtime/data:$root/.runtime/data" -v "$root/.runtime/backup-test:/backup-test")
+docker run "${args[@]}" company-rag-backup-test /opt/company-rag/ops/backup
+archive=$(find .runtime/backup-test/offline-owned-bucket/backups -name '*.tar.gz' | sort | tail -1)
+[ -n "$archive" ]
+docker run "${args[@]}" company-rag-backup-test /opt/company-rag/ops/restore "s3://offline-owned-bucket/backups/$(basename "$archive")"
+printf 'Local backup verification and restore round-trip passed.\n'

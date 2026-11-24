@@ -1,0 +1,39 @@
+#!/bin/bash
+set -euo pipefail
+umask 077
+cd /opt/company-rag
+exec 9>/var/lock/company-rag-backup.lock
+flock -n 9 || exit 1
+work=$(mktemp -d)
+trap 'rm -rf "$work"' EXIT
+aws s3 cp "$1" "$work/backup.tar.gz" --only-show-errors
+# Reject traversal, absolute names, symlinks and unexpected archive members.
+python3 - "$work" <<'PY'
+import pathlib,sys,tarfile
+root=pathlib.Path(sys.argv[1])
+with tarfile.open(root/'backup.tar.gz')as tar:
+ allowed={'rag.dump','keycloak.dump','documents.tar.gz','SHA256SUMS'}
+ if {x.name for x in tar.getmembers()}!=allowed or any(not x.isfile()for x in tar.getmembers()):raise SystemExit('Invalid backup archive')
+ tar.extractall(root)
+PY
+(cd "$work" && sha256sum -c SHA256SUMS)
+compose=(docker compose --env-file .env -f deploy/compose.yml)
+"${compose[@]}" stop --timeout 150 backend keycloak
+for db in rag keycloak; do
+ "${compose[@]}" exec -T postgres pg_restore -U postgres --clean --if-exists --exit-on-error -d "$db" < "$work/$db.dump"
+done
+root=$(python3 -c 'import json;print(json.load(open("deployment.json"))["environment"]["DATA_ROOT"])')
+# Preserve the prior directory until the new archive is safely extracted.
+python3 - "$work/documents.tar.gz" "$root" <<'PY'
+import pathlib,sys,tarfile,shutil,time
+archive=pathlib.Path(sys.argv[1]);root=pathlib.Path(sys.argv[2]);stage=root/('restore-'+str(time.time_ns()));stage.mkdir()
+with tarfile.open(archive)as tar:
+ for m in tar.getmembers():
+  if m.issym() or m.islnk() or not(m.isfile() or m.isdir()) or m.name.startswith('/') or '..' in pathlib.PurePosixPath(m.name).parts:raise SystemExit('Unsafe document archive')
+ tar.extractall(stage)
+if not(stage/'documents').is_dir():raise SystemExit('Missing documents')
+old=root/('documents-before-restore-'+str(time.time_ns()));(root/'documents').rename(old);(stage/'documents').rename(root/'documents');stage.rmdir()
+PY
+chown -R 10001:10001 "$root/documents"
+"${compose[@]}" start keycloak backend
+printf 'Restored. Prior documents retained on disk; inspect before deleting them.\n'

@@ -1,0 +1,130 @@
+name: company-rag
+services:
+  web:
+    image: ${WEB_IMAGE:-company-rag-web:local}
+    pull_policy: ${IMAGE_PULL_POLICY:-build}
+    build:
+      context: ..
+      dockerfile: deploy/web.Dockerfile
+    restart: unless-stopped
+    environment:
+      SITE_ADDRESS: ${SITE_ADDRESS:-http://localhost}
+    ports:
+      - "${HTTP_PORT:-8080}:80"
+      - "${HTTPS_PORT:-8443}:443"
+    volumes:
+      - ${DATA_ROOT:-../.runtime/data}/caddy:/data
+    depends_on:
+      backend:
+        condition: service_started
+      keycloak:
+        condition: service_started
+    logging: &logging
+      driver: json-file
+      options: {max-size: "10m", max-file: "3"}
+  backend:
+    image: ${BACKEND_IMAGE:-company-rag-backend:local}
+    pull_policy: ${IMAGE_PULL_POLICY:-build}
+    build: ../backend
+    restart: unless-stopped
+    stop_grace_period: 150s
+    environment:
+      DATABASE_URL: jdbc:postgresql://postgres:5432/rag
+      RAG_DB_PASSWORD: ${RAG_DB_PASSWORD:?Run ops/local-init first}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?Required}
+      OIDC_ISSUER: ${PUBLIC_URL:-http://localhost:8080}/auth/realms/company
+      OIDC_INTERNAL: http://keycloak:8080/auth/realms/company
+      COOKIE_SECURE: ${COOKIE_SECURE:-false}
+      MODEL_API_BASE: ${MODEL_API_BASE:-https://api.openai.com/v1}
+      MODEL_API_KEY: ${MODEL_API_KEY:-}
+      CHAT_MODEL: ${CHAT_MODEL:-gpt-4.1-mini}
+      EMBEDDING_MODEL: ${EMBEDDING_MODEL:-text-embedding-3-small}
+      EMBEDDING_DIMENSIONS: ${EMBEDDING_DIMENSIONS:-1536}
+      MAX_OUTPUT_TOKENS: ${MAX_OUTPUT_TOKENS:-1200}
+      MOCK_MODEL: ${MOCK_MODEL:-false}
+      S3_ALLOWLIST: ${S3_ALLOWLIST:-}
+      AWS_REGION: ${AWS_REGION:-us-east-1}
+      TELEMETRY_ENABLED: ${TELEMETRY_ENABLED:-false}
+      OTEL_SERVICE_NAME: company-rag
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://alloy:4318
+      OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+      OTEL_TRACES_EXPORTER: ${OTEL_TRACES_EXPORTER:-none}
+      OTEL_LOGS_EXPORTER: ${OTEL_LOGS_EXPORTER:-none}
+      OTEL_METRICS_EXPORTER: none
+      OTEL_INSTRUMENTATION_JDBC_STATEMENT_SANITIZER_ENABLED: "true"
+      OTEL_INSTRUMENTATION_HTTP_CLIENT_CAPTURE_REQUEST_HEADERS: ""
+      OTEL_INSTRUMENTATION_HTTP_SERVER_CAPTURE_REQUEST_HEADERS: ""
+      OTEL_RESOURCE_ATTRIBUTES: deployment.environment=${ENVIRONMENT:-development}
+    volumes:
+      - ${DATA_ROOT:-../.runtime/data}/documents:/data/documents
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *logging
+  postgres:
+    image: pgvector/pgvector:0.8.1-pg17-bookworm
+    restart: unless-stopped
+    environment:
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Required}
+      RAG_DB_PASSWORD: ${RAG_DB_PASSWORD:?Required}
+      KEYCLOAK_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?Required}
+    volumes:
+      - ${DATA_ROOT:-../.runtime/data}/postgres:/var/lib/postgresql/data
+      - ./postgres-init.sh:/docker-entrypoint-initdb.d/10-company-rag.sh:ro
+    healthcheck:
+      test: [CMD-SHELL, "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+    logging: *logging
+  keycloak:
+    image: quay.io/keycloak/keycloak:26.4.7
+    command: [start, --import-realm]
+    restart: unless-stopped
+    environment:
+      KC_DB: postgres
+      KC_DB_URL: jdbc:postgresql://postgres:5432/keycloak
+      KC_DB_USERNAME: keycloak
+      KC_DB_PASSWORD: ${KEYCLOAK_DB_PASSWORD:?Required}
+      KC_HTTP_ENABLED: "true"
+      KC_HTTP_RELATIVE_PATH: /auth
+      KC_HOSTNAME: ${PUBLIC_URL:-http://localhost:8080}/auth
+      KC_PROXY_HEADERS: xforwarded
+      KC_BOOTSTRAP_ADMIN_USERNAME: operator
+      KC_BOOTSTRAP_ADMIN_PASSWORD: ${KEYCLOAK_ADMIN_PASSWORD:?Required}
+      OIDC_CLIENT_SECRET: ${OIDC_CLIENT_SECRET:?Required}
+      PROVISIONER_SECRET: ${PROVISIONER_SECRET:?Required}
+      COMPANY_ADMIN_EMAIL: ${COMPANY_ADMIN_EMAIL:-admin@example.test}
+      COMPANY_ADMIN_PASSWORD: ${COMPANY_ADMIN_PASSWORD:?Required}
+      PUBLIC_URL: ${PUBLIC_URL:-http://localhost:8080}
+      SMTP_HOST: ${SMTP_HOST:-mailpit}
+      SMTP_PORT: ${SMTP_PORT:-1025}
+      SMTP_FROM: ${SMTP_FROM:-assistant@example.test}
+      SMTP_AUTH: ${SMTP_AUTH:-false}
+      SMTP_STARTTLS: ${SMTP_STARTTLS:-false}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASSWORD: ${SMTP_PASSWORD:-}
+    volumes:
+      - ./keycloak/realm.json:/opt/keycloak/data/import/company-realm.json:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    logging: *logging
+  mailpit:
+    image: axllent/mailpit:v1.27.10
+    profiles: [development]
+    ports: ["127.0.0.1:8025:8025"]
+    logging: *logging
+  alloy:
+    image: grafana/alloy:v1.11.2
+    profiles: [telemetry]
+    command: [run, /etc/alloy/config.alloy, --storage.path=/var/lib/alloy]
+    restart: unless-stopped
+    environment:
+      GRAFANA_OTLP_ENDPOINT: ${GRAFANA_OTLP_ENDPOINT:-}
+      GRAFANA_INSTANCE_ID: ${GRAFANA_INSTANCE_ID:-}
+      GRAFANA_TOKEN: ${GRAFANA_TOKEN:-}
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - ${DATA_ROOT:-../.runtime/data}/alloy:/var/lib/alloy
+    logging: *logging

@@ -1,0 +1,9 @@
+#!/bin/bash
+set -euo pipefail
+[ "${1:-}" = --confirm-reindex ] || { echo 'Pass --confirm-reindex to discard vectors and rebuild all documents with current model settings.'; exit 2; }
+cd "$(dirname "$0")/.."
+compose=(docker compose --env-file .env -f deploy/compose.yml)
+"${compose[@]}" stop --timeout 150 backend
+"${compose[@]}" exec -T postgres psql -U postgres -d rag -v ON_ERROR_STOP=1 -c "BEGIN; TRUNCATE chunks; DELETE FROM embedding_profile; UPDATE documents SET status='Queued',error=NULL,lease_at=NULL; COMMIT;"
+"${compose[@]}" up -d --no-build backend
+printf 'Reindex queued. Documents become searchable again as processing completes.\n'

@@ -1,0 +1,4 @@
+region = "us-east-1"
+customer = "example"
+availability_zone = "us-east-1a"
+data_size_gb = 50

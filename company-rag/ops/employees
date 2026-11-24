@@ -1,0 +1,145 @@
+#!/usr/bin/env python3
+"""Create/update/invite employees through Keycloak's Admin API; never copy passwords."""
+import argparse, csv, json, os, pathlib, urllib.request, urllib.parse, urllib.error
+
+p = argparse.ArgumentParser(description=__doc__)
+p.add_argument("--url", required=True, help="Keycloak base URL including /auth")
+p.add_argument("--csv", type=pathlib.Path)
+p.add_argument("--email")
+p.add_argument("--employee-id")
+p.add_argument("--roles", default="employee")
+p.add_argument("--disable", action="store_true")
+p.add_argument("--allow-admin", action="store_true")
+args = p.parse_args()
+secret = os.environ.get("PROVISIONER_SECRET")
+if not secret:
+    p.error("Set PROVISIONER_SECRET in the operator environment")
+base = args.url.rstrip("/")
+if not base.startswith("https://") and not base.startswith("http://localhost:"):
+    p.error("Use HTTPS outside local development")
+form = urllib.parse.urlencode(
+    {
+        "grant_type": "client_credentials",
+        "client_id": "employee-provisioner",
+        "client_secret": secret,
+    }
+).encode()
+with urllib.request.urlopen(
+    urllib.request.Request(
+        base + "/realms/company/protocol/openid-connect/token", data=form
+    )
+) as r:
+    token = json.load(r)["access_token"]
+
+
+def api(method, path, body=None):
+    req = urllib.request.Request(
+        base + "/admin/realms/company" + path,
+        data=None if body is None else json.dumps(body).encode(),
+        method=method,
+        headers={
+            "Authorization": "Bearer " + token,
+            "Content-Type": "application/json",
+        },
+    )
+    with urllib.request.urlopen(req) as r:
+        return json.loads(r.read() or "null")
+
+
+def provision(row):
+    email = row["email"].strip().lower()
+    external = row.get("employee_id", "").strip()
+    active = str(row.get("active", "true")).lower() not in ["false", "0", "no"]
+    roles = set(
+        x.strip()
+        for x in row.get("roles", "employee").replace(";", ",").split(",")
+        if x.strip()
+    ) | {"employee"}
+    if "company-admin" in roles and not args.allow_admin:
+        raise ValueError("company-admin requires --allow-admin")
+    if "@" not in email:
+        raise ValueError("Valid employee email required")
+    users = api(
+        "GET",
+        "/users?"
+        + urllib.parse.urlencode(
+            {"q": "employee_id:" + external}
+            if external
+            else {"email": email, "exact": "true"}
+        ),
+    )
+    if len(users) > 1:
+        raise ValueError(
+            "Ambiguous employee identity; resolve records before provisioning"
+        )
+    created = not users
+    if created:
+        user = {
+            "username": external or email,
+            "email": email,
+            "enabled": active,
+            "emailVerified": False,
+            "attributes": {"employee_id": [external]} if external else {},
+            "requiredActions": ["VERIFY_EMAIL", "UPDATE_PASSWORD"],
+        }
+        api("POST", "/users", user)
+        users = api(
+            "GET",
+            "/users?"
+            + urllib.parse.urlencode({"username": external or email, "exact": "true"}),
+        )
+    user = users[0]
+    uid = user["id"]
+    user.update(email=email, enabled=active)
+    api("PUT", "/users/" + uid, user)
+    current = api("GET", "/users/" + uid + "/role-mappings/realm")
+    desired = [
+        api("GET", "/roles/" + urllib.parse.quote(role, safe=""))
+        for role in sorted(roles)
+    ]
+    # This tool owns the business role assignment for imported users; retain Keycloak default roles.
+    remove = [
+        role
+        for role in current
+        if role["name"] not in roles and not role["name"].startswith("default-roles-")
+    ]
+    if remove:
+        api("DELETE", "/users/" + uid + "/role-mappings/realm", remove)
+    api("POST", "/users/" + uid + "/role-mappings/realm", desired)
+    if not active:
+        api("POST", "/users/" + uid + "/logout")
+    elif created:
+        api(
+            "PUT",
+            "/users/" + uid + "/execute-actions-email?lifespan=86400",
+            ["VERIFY_EMAIL", "UPDATE_PASSWORD"],
+        )
+    print(
+        ("Invited" if created and active else "Updated")
+        + " employee "
+        + (external or email)
+    )
+
+
+try:
+    if args.csv:
+        with args.csv.open(newline="") as f:
+            for row in csv.DictReader(f):
+                provision(row)
+    elif args.email:
+        provision(
+            {
+                "email": args.email,
+                "employee_id": args.employee_id or "",
+                "roles": args.roles,
+                "active": not args.disable,
+            }
+        )
+    else:
+        p.error("Provide --csv or --email")
+except urllib.error.HTTPError as e:
+    raise SystemExit(
+        "Keycloak operation failed with HTTP "
+        + str(e.code)
+        + "; inspect user/account state before retrying"
+    )

@@ -1,0 +1,49 @@
+#!/usr/bin/env python3
+import pathlib, secrets, os
+
+root = pathlib.Path(__file__).resolve().parents[1]
+env = root / ".env"
+if env.exists():
+    raise SystemExit(".env already exists; existing credentials were left unchanged")
+values = {
+    key: secrets.token_urlsafe(32)
+    for key in [
+        "POSTGRES_PASSWORD",
+        "RAG_DB_PASSWORD",
+        "KEYCLOAK_DB_PASSWORD",
+        "OIDC_CLIENT_SECRET",
+        "KEYCLOAK_ADMIN_PASSWORD",
+        "COMPANY_ADMIN_PASSWORD",
+        "PROVISIONER_SECRET",
+    ]
+}
+values.update(
+    PUBLIC_URL="http://localhost:8080",
+    SITE_ADDRESS="http://localhost",
+    HTTP_PORT="8080",
+    HTTPS_PORT="8443",
+    COOKIE_SECURE="false",
+    DATA_ROOT=str(root / ".runtime/data"),
+    COMPANY_ADMIN_EMAIL="admin@example.test",
+    MODEL_API_KEY="",
+    CHAT_MODEL="gpt-4.1-mini",
+    EMBEDDING_MODEL="text-embedding-3-small",
+    EMBEDDING_DIMENSIONS="1536",
+    MOCK_MODEL="false",
+    S3_ALLOWLIST="",
+    AWS_REGION="us-east-1",
+)
+fd = os.open(env, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+with os.fdopen(fd, "w") as f:
+    f.write("\n".join(f"{k}={v}" for k, v in values.items()) + "\n")
+path = root / ".runtime/data/documents"
+path.mkdir(parents=True, exist_ok=True)
+# Development host bind mount; production bootstrap assigns the container UID.
+(root / ".runtime").chmod(0o700)
+path.chmod(0o777)
+print(
+    "Created .env. Set MODEL_API_KEY, then run Compose with --profile development. Mail inbox: http://localhost:8025"
+)
+print(
+    "Initial admin credentials are in .env (not printed). Complete password setup and email verification on first login."
+)

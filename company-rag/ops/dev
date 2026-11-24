@@ -1,0 +1,8 @@
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+[ -f .env ] || ./ops/local-init
+if [ "${1:-}" = --mock ]; then export MOCK_MODEL=true; fi
+docker compose --env-file .env -f deploy/compose.yml --profile development up --build -d
+./ops/readiness http://localhost:8080
+printf 'Admin: http://localhost:8080/admin/\nChat: http://localhost:8080/chat/\nDevelopment inbox: http://localhost:8025\n'

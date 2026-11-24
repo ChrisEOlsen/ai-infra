@@ -1,0 +1,8 @@
+**/node_modules
+**/target
+**/.angular
+**/.cache
+**/dist
+.env
+.runtime
+.git

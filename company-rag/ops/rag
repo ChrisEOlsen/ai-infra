@@ -1,0 +1,491 @@
+#!/usr/bin/env python3
+"""Customer-scoped operator CLI. Uses Terraform and AWS CLI; never embeds secrets in Terraform."""
+import argparse, hashlib, json, os, pathlib, re, shlex, subprocess, sys, tarfile, time
+
+ROOT = pathlib.Path(__file__).resolve().parents[1]
+STATE_ROOT = pathlib.Path(
+    os.environ.get("COMPANY_RAG_STATE_DIR", str(ROOT / ".runtime"))
+).resolve()
+
+
+def run(args, *, capture=False, cwd=None, input=None, env=None):
+    return subprocess.run(
+        [str(x) for x in args],
+        cwd=cwd,
+        input=input,
+        text=True,
+        check=True,
+        env=env,
+        stdout=subprocess.PIPE if capture else None,
+    ).stdout
+
+
+def aws(*args, capture=True):
+    return run(
+        ["aws", "--region", config["region"], *args],
+        capture=capture,
+    )
+
+
+def state_dir(layer):
+    p = STATE_ROOT / config["customer"] / layer
+    p.mkdir(parents=True, exist_ok=True)
+    p.chmod(0o700)
+    return p
+
+
+def tf(layer, *args, capture=False):
+    directory = ROOT / "terraform/aws" / ("storage" if layer == "storage" else "")
+    return run(
+        [os.environ.get("TERRAFORM", "terraform"), f"-chdir={directory}", *args],
+        capture=capture,
+        env={**os.environ, "TF_DATA_DIR": str(state_dir(layer) / ".terraform")},
+    )
+
+
+def initialize(layer):
+    path = state_dir(layer) / "terraform.tfstate"
+    tf(
+        layer,
+        "init",
+        "-input=false",
+        "-reconfigure",
+        f"-backend-config=path={path}",
+        capture=True,
+    )
+
+
+def outputs(layer):
+    initialize(layer)
+    result = {
+        k: v["value"]
+        for k, v in json.loads(tf(layer, "output", "-json", capture=True)).items()
+    }
+    if result and result.get("customer") != config["customer"]:
+        raise RuntimeError("Terraform state belongs to another customer")
+    return result
+
+
+def varsfile(layer, values):
+    p = state_dir(layer) / "input.tfvars.json"
+    p.write_text(json.dumps(values, indent=2))
+    p.chmod(0o600)
+    return p
+
+
+def verify_instance(runtime):
+    if runtime.get("customer") != config["customer"]:
+        raise RuntimeError("Terraform state belongs to another customer")
+    result = json.loads(
+        aws("ec2", "describe-instances", "--instance-ids", runtime["instance_id"])
+    )["Reservations"][0]["Instances"][0]
+    tags = {x["Key"]: x["Value"] for x in result.get("Tags", [])}
+    if (
+        tags.get("Customer") != config["customer"]
+        or tags.get("Project") != "company-rag"
+    ):
+        raise RuntimeError("Instance ownership check failed")
+    return result
+
+
+def ssm(script, runtime=None):
+    runtime = runtime or outputs("runtime")
+    verify_instance(runtime)
+    payload = {"commands": ["set -eu\n" + script], "executionTimeout": ["900"]}
+    result = json.loads(
+        aws(
+            "ssm",
+            "send-command",
+            "--instance-ids",
+            runtime["instance_id"],
+            "--document-name",
+            "AWS-RunShellScript",
+            "--parameters",
+            json.dumps(payload),
+        )
+    )
+    command = result["Command"]["CommandId"]
+    for _ in range(180):
+        time.sleep(5)
+        try:
+            reply = json.loads(
+                aws(
+                    "ssm",
+                    "get-command-invocation",
+                    "--command-id",
+                    command,
+                    "--instance-id",
+                    runtime["instance_id"],
+                )
+            )
+        except subprocess.CalledProcessError:
+            continue
+        if reply["Status"] == "Success":
+            return reply.get("StandardOutputContent", "")
+        if reply["Status"] in ["Failed", "TimedOut", "Cancelled"]:
+            raise RuntimeError(
+                "Remote operation failed; inspect SSM command " + command
+            )
+    raise RuntimeError(
+        "Remote operation did not complete; inspect SSM command " + command
+    )
+
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument(
+    "action",
+    choices=[
+        "storage",
+        "set-secret",
+        "deploy",
+        "status",
+        "pause",
+        "resume",
+        "backup",
+        "restore",
+        "decommission",
+    ],
+)
+parser.add_argument("config", type=pathlib.Path)
+parser.add_argument("--secret-file", type=pathlib.Path)
+parser.add_argument("--archive", help="s3:// backup URI for restore")
+retention = parser.add_mutually_exclusive_group()
+retention.add_argument("--retain-data", action="store_true")
+retention.add_argument("--delete-data", action="store_true")
+parser.add_argument("--confirm", help="Exact customer slug for destructive operations")
+parser.add_argument(
+    "--credentials-revoked",
+    action="store_true",
+    help="Confirm dedicated model/SMTP/source credentials have been revoked or intentionally retained",
+)
+args = parser.parse_args()
+config = json.loads(args.config.read_text())
+if not re.fullmatch("[a-z][a-z0-9-]{2,24}", config.get("customer", "")):
+    parser.error("Invalid customer slug")
+if not re.fullmatch("[a-z0-9.-]+", config.get("domain", "")):
+    parser.error("Invalid application domain")
+for source in config.get("source_locations", []):
+    if source["prefix"] and not source["prefix"].endswith("/"):
+        parser.error("Source folder prefixes must end in /")
+if any(
+    re.search("PASSWORD|SECRET|TOKEN|API_KEY", k) for k in config.get("environment", {})
+):
+    parser.error("Credentials belong in Secrets Manager, not customer configuration")
+try:
+    if args.action == "storage":
+        initialize("storage")
+        p = varsfile(
+            "storage",
+            {
+                k: config[k]
+                for k in ["region", "customer", "availability_zone", "data_size_gb"]
+            },
+        )
+        tf("storage", "apply", f"-var-file={p}")
+        print(json.dumps(outputs("storage"), indent=2))
+    elif args.action == "set-secret":
+        if not args.secret_file:
+            parser.error("--secret-file is required")
+        data = json.loads(args.secret_file.read_text())
+        required = [
+            "POSTGRES_PASSWORD",
+            "RAG_DB_PASSWORD",
+            "KEYCLOAK_DB_PASSWORD",
+            "OIDC_CLIENT_SECRET",
+            "KEYCLOAK_ADMIN_PASSWORD",
+            "COMPANY_ADMIN_PASSWORD",
+            "PROVISIONER_SECRET",
+            "MODEL_API_KEY",
+        ]
+        if any(not data.get(k) for k in required):
+            parser.error("Credential file is missing required values")
+        for value in data.values():
+            if not isinstance(value, str) or any(c in value for c in ["'", "\n", "\r"]):
+                parser.error(
+                    "Credential values must be single-line strings without single quotes"
+                )
+        aws(
+            "secretsmanager",
+            "put-secret-value",
+            "--secret-id",
+            outputs("storage")["secret_arn"],
+            "--secret-string",
+            "file://" + str(args.secret_file.resolve()),
+        )
+        print(
+            "Runtime credentials stored. Values were not printed or added to Terraform state."
+        )
+    elif args.action == "deploy":
+        storage = outputs("storage")
+        aws("secretsmanager", "describe-secret", "--secret-id", storage["secret_arn"])
+        versions = json.loads(
+            aws(
+                "secretsmanager",
+                "list-secret-version-ids",
+                "--secret-id",
+                storage["secret_arn"],
+            )
+        )
+        if not versions.get("Versions"):
+            raise RuntimeError("Run set-secret before deployment")
+        # Require locally built images so deployment never builds source on the customer server.
+        tag = "release-" + str(int(time.time()))
+        for component, recipe, context in [
+            ("backend", "backend/Dockerfile", "backend"),
+            ("web", "deploy/web.Dockerfile", "."),
+        ]:
+            image = storage[component + "_repository"] + ":" + tag
+            run(
+                [
+                    "docker",
+                    "build",
+                    "--platform",
+                    "linux/amd64",
+                    "-f",
+                    ROOT / recipe,
+                    "-t",
+                    image,
+                    ROOT / context,
+                ]
+            )
+            registry = storage[component + "_repository"].split("/")[0]
+            password = aws("ecr", "get-login-password")
+            run(
+                ["docker", "login", "--username", "AWS", "--password-stdin", registry],
+                input=password,
+            )
+            run(["docker", "push", image])
+        release = state_dir("runtime") / "release.tar.gz"
+        with tarfile.open(release, "w:gz") as tar:
+            for folder in ["deploy", "ops"]:
+                for file in (ROOT / folder).rglob("*"):
+                    if file.is_file() and "__pycache__" not in file.parts:
+                        tar.add(file, arcname=str(file.relative_to(ROOT)))
+        values = {
+            k: config[k]
+            for k in [
+                "region",
+                "customer",
+                "availability_zone",
+                "domain",
+                "instance_type",
+                "source_locations",
+                "environment",
+            ]
+        }
+        values.update(
+            data_volume_id=storage["volume_id"],
+            bucket=storage["bucket"],
+            secret_arn=storage["secret_arn"],
+            release_archive=str(release),
+            release_sha256=hashlib.sha256(release.read_bytes()).hexdigest(),
+            backend_image=storage["backend_repository"] + ":" + tag,
+            web_image=storage["web_repository"] + ":" + tag,
+        )
+        if config.get("zone_id"):
+            values["zone_id"] = config["zone_id"]
+        if config.get("ingress_cidrs"):
+            values["ingress_cidrs"] = config["ingress_cidrs"]
+        initialize("runtime")
+        p = varsfile("runtime", values)
+        tf("runtime", "apply", f"-var-file={p}")
+        runtime = outputs("runtime")
+        print(
+            "Point DNS at " + runtime["public_ip"] + "; application: " + runtime["url"]
+        )
+        print(
+            "Bootstrap readiness (after DNS resolves): ops/readiness " + runtime["url"]
+        )
+    elif args.action == "status":
+        storage = outputs("storage")
+        runtime = outputs("runtime")
+        instance = verify_instance(runtime)
+        print(
+            json.dumps(
+                {
+                    "instance": instance["State"]["Name"],
+                    "runtime": runtime,
+                    "retained_resources": storage,
+                    "notes": [
+                        "Model API and Grafana retention are external to Terraform."
+                    ],
+                },
+                indent=2,
+            )
+        )
+    elif args.action == "pause":
+        runtime = outputs("runtime")
+        instance = verify_instance(runtime)
+        if instance["State"]["Name"] == "running":
+            ssm(
+                "cd /opt/company-rag\ndocker compose --env-file .env -f deploy/compose.yml exec -T postgres psql -U postgres -d rag -c 'UPDATE app_state SET accepting=false WHERE id=1'\nsystemctl stop company-rag-backup.timer company-rag.service",
+                runtime,
+            )
+            aws("ec2", "stop-instances", "--instance-ids", runtime["instance_id"])
+            aws(
+                "ec2",
+                "wait",
+                "instance-stopped",
+                "--instance-ids",
+                runtime["instance_id"],
+            )
+        print(
+            "Paused. EBS, backups, Elastic IP, secrets, ECR and remote telemetry remain chargeable."
+        )
+    elif args.action == "resume":
+        runtime = outputs("runtime")
+        verify_instance(runtime)
+        aws("ec2", "start-instances", "--instance-ids", runtime["instance_id"])
+        aws("ec2", "wait", "instance-running", "--instance-ids", runtime["instance_id"])
+        print(
+            ssm(
+                "systemctl start company-rag.service company-rag-backup.timer\ncd /opt/company-rag\ndocker compose --env-file .env -f deploy/compose.yml exec -T postgres psql -U postgres -d rag -c 'UPDATE app_state SET accepting=true WHERE id=1'",
+                runtime,
+            )
+        )
+        print("Server resumed. Run ops/readiness to verify application startup.")
+    elif args.action == "backup":
+        print(ssm("/opt/company-rag/ops/backup"))
+    elif args.action == "restore":
+        if args.confirm != config["customer"] or not args.archive:
+            parser.error("Restore requires --archive and --confirm CUSTOMER")
+        bucket = outputs("storage")["bucket"]
+        if not args.archive.startswith("s3://" + bucket + "/backups/"):
+            parser.error("Only this deployment’s backup prefix may be restored")
+        print(ssm("/opt/company-rag/ops/restore " + shlex.quote(args.archive)))
+    elif args.action == "decommission":
+        if args.confirm != config["customer"] or not (
+            args.retain_data or args.delete_data
+        ):
+            parser.error("Choose --retain-data or --delete-data and --confirm CUSTOMER")
+        if not args.credentials_revoked:
+            parser.error(
+                "Review/revoke dedicated hosted-model, SMTP and connector credentials, then pass --credentials-revoked"
+            )
+        storage = outputs("storage")
+        runtime = outputs("runtime")
+        if runtime:
+            instance = verify_instance(runtime)
+            if instance["State"]["Name"] == "running":
+                print(ssm("/opt/company-rag/ops/backup", runtime))
+                ssm(
+                    "systemctl stop company-rag-backup.timer company-rag.service",
+                    runtime,
+                )
+            runtime_vars = state_dir("runtime") / "input.tfvars.json"
+            tf("runtime", "destroy", f"-var-file={runtime_vars}")
+            aws(
+                "ec2",
+                "wait",
+                "instance-terminated",
+                "--instance-ids",
+                runtime["instance_id"],
+            )
+        else:
+            print("Runtime is already decommissioned; reviewing retained storage.")
+        addresses = json.loads(
+            aws(
+                "ec2",
+                "describe-addresses",
+                "--filters",
+                "Name=tag:Customer,Values=" + config["customer"],
+                "Name=tag:Project,Values=company-rag",
+            )
+        )
+        if addresses["Addresses"]:
+            raise RuntimeError(
+                "Public IP allocations remain; inspect AWS before declaring completion"
+            )
+        if args.delete_data:
+            tags = json.loads(
+                aws("s3api", "get-bucket-tagging", "--bucket", storage["bucket"])
+            )["TagSet"]
+            if {t["Key"]: t["Value"] for t in tags}.get("Customer") != config[
+                "customer"
+            ]:
+                raise RuntimeError("Bucket ownership check failed")
+            # Include old object versions and delete markers, not only current objects.
+            while True:
+                page = json.loads(
+                    aws(
+                        "s3api",
+                        "list-object-versions",
+                        "--bucket",
+                        storage["bucket"],
+                        "--max-keys",
+                        "1000",
+                        "--no-paginate",
+                    )
+                )
+                objects = [
+                    {"Key": x["Key"], "VersionId": x["VersionId"]}
+                    for x in page.get("Versions", []) + page.get("DeleteMarkers", [])
+                ]
+                if not objects:
+                    break
+                reply = json.loads(
+                    aws(
+                        "s3api",
+                        "delete-objects",
+                        "--bucket",
+                        storage["bucket"],
+                        "--delete",
+                        json.dumps({"Objects": objects, "Quiet": True}),
+                    )
+                )
+                if reply.get("Errors"):
+                    raise RuntimeError("Some versioned objects could not be deleted")
+            for name in ["backend", "web"]:
+                repo = storage[name + "_repository"].split("/", 1)[1]
+                while True:
+                    images = json.loads(
+                        aws(
+                            "ecr",
+                            "list-images",
+                            "--repository-name",
+                            repo,
+                            "--max-results",
+                            "100",
+                            "--no-paginate",
+                        )
+                    )["imageIds"]
+                    if not images:
+                        break
+                    result = json.loads(
+                        aws(
+                            "ecr",
+                            "batch-delete-image",
+                            "--repository-name",
+                            repo,
+                            "--image-ids",
+                            json.dumps(images),
+                        )
+                    )
+                    if result.get("failures"):
+                        raise RuntimeError("Container images could not be deleted")
+            tf(
+                "storage",
+                "destroy",
+                f'-var-file={state_dir("storage")/"input.tfvars.json"}',
+            )
+        report = {
+            "customer": config["customer"],
+            "terminated_instance": runtime.get("instance_id", "previously terminated"),
+            "public_ips_remaining": 0,
+            "retained_resources": storage if args.retain_data else {},
+            "notes": [
+                (
+                    "Retained storage, images and secrets incur charges."
+                    if args.retain_data
+                    else "Secrets Manager deletion has a 7-day recovery window; verify AWS inventory after it expires."
+                ),
+                "External provider/Grafana retention and customer-owned source buckets are unchanged.",
+                "Terraform state is retained locally for audit; protect and back it up.",
+            ],
+        }
+        path = STATE_ROOT / config["customer"] / "decommission-report.json"
+        path.write_text(json.dumps(report, indent=2))
+        print(path.read_text())
+except (subprocess.CalledProcessError, RuntimeError) as error:
+    print("Operation did not complete:", str(error), file=sys.stderr)
+    sys.exit(1)

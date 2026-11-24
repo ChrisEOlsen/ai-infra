@@ -1,0 +1,248 @@
+<div class="app-shell">
+  <header class="topbar">
+    <a class="brand" href="/admin/"
+      ><span class="brand-mark"><mat-icon>folder</mat-icon></span
+      ><strong>Company knowledge</strong></a
+    >
+    <div class="actions">
+      <a mat-button href="/chat/"><mat-icon>chat</mat-icon>Open chat</a
+      ><app-icon-button icon="logout" label="Sign out" (pressed)="logout()" />
+    </div>
+  </header>
+  <div class="workspace">
+    <nav aria-label="Administration">
+      @for(item of ['Documents','Collections','Sources'];track item){<button
+        mat-button
+        [class.active]="page()===item"
+        [attr.aria-current]="page()===item ? 'page' : null"
+        (click)="page.set($any(item))"
+      >
+        <mat-icon
+          >{{item==='Documents'?'description':item==='Collections'?'folder':'cloud'}}</mat-icon
+        >{{item}}</button
+      >}
+    </nav>
+    <main [attr.aria-label]="page()">
+      @if(page()!=='Documents'){
+      <div class="page-actions">
+        <div class="actions">
+          <app-icon-button
+            icon="refresh"
+            label="Refresh"
+            [disabled]="loading()||busy()||!authorized()"
+            (pressed)="load()"
+          />
+          @if(page()==='Collections'){<button
+            mat-flat-button
+            [disabled]="!authorized()||busy()"
+            (click)="editCollection()"
+          >
+            <mat-icon>add</mat-icon>New collection</button
+          >} @if(page()==='Sources'){<button
+            mat-flat-button
+            [disabled]="!authorized()||!collections().length||busy()"
+            (click)="addSource()"
+          >
+            <mat-icon>add</mat-icon>Connect source</button
+          >}
+        </div>
+      </div>
+      } @if(error()){
+      <div class="error-banner" role="alert">{{error()}}</div>
+      } @if(page()==='Documents'){
+      <section
+        class="upload-panel"
+        [class.dragging]="dragging"
+        (dragover)="$event.preventDefault();dragging=true"
+        (dragleave)="dragging=false"
+        (drop)="drop($event)"
+        aria-label="Upload documents"
+      >
+        <div class="upload-heading">
+          <mat-icon>upload_file</mat-icon><strong>Upload documents</strong>
+        </div>
+        <div class="upload-controls">
+          <mat-form-field appearance="outline" subscriptSizing="dynamic"
+            ><mat-label>Collection</mat-label
+            ><mat-select
+              [(ngModel)]="collection"
+              [disabled]="loading()||uploading()||!authorized()"
+              >@for(c of collections();track c.id){<mat-option [value]="c.id"
+                >{{c.name}}</mat-option
+              >}</mat-select
+            ></mat-form-field
+          >
+          <button
+            mat-flat-button
+            [disabled]="!collection||uploading()||!authorized()"
+            (click)="files.click()"
+          >
+            <mat-icon>add</mat-icon>Choose files</button
+          ><input
+            #files
+            type="file"
+            hidden
+            multiple
+            accept=".pdf,.docx,.md,.txt"
+            (change)="upload(files.files);files.value=''"
+          />
+          <span class="text-muted file-hint"
+            >PDF, DOCX, Markdown, TXT · up to 20 MB each</span
+          >
+        </div>
+        <div class="progress-slot">
+          @if(uploading()){<mat-progress-bar
+            mode="indeterminate"
+            aria-label="Uploading documents"
+          />}
+        </div>
+      </section>
+      <section class="panel" aria-label="Documents">
+        <div class="table-row table-head">
+          <span>Document</span><span>Collection</span><span>Status</span
+          ><span>Updated</span>
+          <div class="actions">
+            <app-icon-button
+              icon="refresh"
+              label="Refresh"
+              [disabled]="loading()||busy()||!authorized()"
+              (pressed)="load()"
+            />
+          </div>
+        </div>
+        @if(loading()){@for(i of [1,2,3,4];track i){
+        <div class="table-row">
+          <app-skeleton width="75%" /><app-skeleton width="65%" /><app-skeleton
+            width="75px"
+          /><app-skeleton width="80px" /><app-skeleton
+            width="32px"
+            height="32px"
+          />
+        </div>
+        }} @else{@for(d of documents();track d.id){
+        <div class="table-row">
+          <span class="document-name"
+            ><mat-icon>description</mat-icon
+            ><span
+              >{{d.name}}@if(d.error){<small class="text-error"
+                >{{d.error}}</small
+              >}</span
+            ></span
+          ><span>{{d.collection_name}}</span
+          ><span
+            ><span class="status" [attr.data-status]="d.status"
+              >{{d.status}}</span
+            ></span
+          ><span class="text-muted">{{d.updated_at|date:'MMM d, HH:mm'}}</span>
+          <div class="actions">
+            @if(d.status==='Failed'){<app-icon-button
+              icon="refresh"
+              label="Retry processing"
+              [disabled]="busy()"
+              (pressed)="retry(d.id)"
+            />}<app-icon-button
+              icon="delete"
+              label="Delete document"
+              [disabled]="busy()"
+              (pressed)="remove('documents',d.id,d.name)"
+            />
+          </div>
+        </div>
+        }@empty{
+        <div class="empty">
+          <mat-icon>description</mat-icon
+          ><strong>No documents yet</strong>@if(!collections().length){<button
+            mat-button
+            (click)="page.set('Collections')"
+          >
+            Create a collection</button
+          >}
+        </div>
+        }}
+      </section>
+      } @if(page()==='Collections'){
+      <div class="collection-grid">
+        @if(loading()){@for(i of [1,2,3];track i){
+        <section class="collection-card">
+          <app-skeleton width="60%" height="26px" /><app-skeleton
+            height="32px"
+          />
+        </section>
+        }} @else{@for(c of collections();track c.id){
+        <section class="collection-card">
+          <div class="card-heading">
+            <h2>{{c.name}}</h2>
+            <app-icon-button
+              icon="edit"
+              label="Edit collection access"
+              [disabled]="busy()"
+              (pressed)="editCollection(c)"
+            />
+          </div>
+          <div class="roles">
+            @for(role of c.roles;track role){<span class="role">{{role}}</span>}
+          </div>
+        </section>
+        }@empty{
+        <div class="empty">
+          <mat-icon>folder</mat-icon><strong>No collections yet</strong>
+        </div>
+        }}
+      </div>
+      } @if(page()==='Sources'){
+      <section class="panel" aria-label="Connected sources">
+        <div class="source-row table-head">
+          <span>Source</span><span>Collection</span><span>Status</span
+          ><span>Last synchronized</span><span></span>
+        </div>
+        @if(loading()){@for(i of [1,2,3];track i){
+        <div class="source-row">
+          <app-skeleton /><app-skeleton /><app-skeleton
+            width="75px"
+          /><app-skeleton width="80px" /><app-skeleton
+            width="72px"
+            height="32px"
+          />
+        </div>
+        }} @else{@for(s of sources();track s.id){
+        <div class="source-row">
+          <span class="document-name"
+            ><mat-icon>cloud</mat-icon
+            ><span
+              >s3://{{s.bucket}}/{{s.prefix}}@if(s.error){<small
+                class="text-error"
+                >{{s.error}}</small
+              >}</span
+            ></span
+          ><span>{{s.collection_name}}</span
+          ><span
+            ><span class="status" [attr.data-status]="s.status"
+              >{{s.status}}</span
+            ></span
+          ><span class="text-muted"
+            >{{s.synced_at?(s.synced_at|date:'MMM d, HH:mm'):'—'}}</span
+          >
+          <div class="actions">
+            <app-icon-button
+              icon="refresh"
+              label="Synchronize source"
+              [disabled]="busy()||s.status==='Syncing'"
+              (pressed)="sync(s.id)"
+            /><app-icon-button
+              icon="delete"
+              label="Disconnect source"
+              [disabled]="busy()"
+              (pressed)="remove('sources',s.id,s.bucket)"
+            />
+          </div>
+        </div>
+        }@empty{
+        <div class="empty">
+          <mat-icon>cloud</mat-icon><strong>No connected sources</strong>
+        </div>
+        }}
+      </section>
+      }
+    </main>
+  </div>
+</div>

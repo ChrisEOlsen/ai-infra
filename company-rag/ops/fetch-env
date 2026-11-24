@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+"""Runs on EC2. Never prints secret values."""
+import json, os, pathlib, subprocess
+
+root = pathlib.Path("/opt/company-rag")
+cfg = json.loads((root / "deployment.json").read_text())
+raw = subprocess.check_output(
+    [
+        "aws",
+        "secretsmanager",
+        "get-secret-value",
+        "--region",
+        cfg["region"],
+        "--secret-id",
+        cfg["secret_arn"],
+        "--query",
+        "SecretString",
+        "--output",
+        "text",
+    ],
+    text=True,
+)
+values = json.loads(raw)
+required = [
+    "POSTGRES_PASSWORD",
+    "RAG_DB_PASSWORD",
+    "KEYCLOAK_DB_PASSWORD",
+    "OIDC_CLIENT_SECRET",
+    "KEYCLOAK_ADMIN_PASSWORD",
+    "COMPANY_ADMIN_PASSWORD",
+    "PROVISIONER_SECRET",
+    "MODEL_API_KEY",
+]
+if any(not values.get(k) for k in required):
+    raise SystemExit("Runtime secret is missing required credentials")
+values.update(cfg["environment"])
+if values.get("MOCK_MODEL", "false") != "false":
+    raise SystemExit("Mock models are forbidden in AWS deployment")
+for key, value in values.items():
+    if not isinstance(value, str) or any(c in value for c in ["\n", "\r", "'"]):
+        raise SystemExit(
+            "Secret values must be single-line strings without single quotes"
+        )
+fd = os.open(root / ".env", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+with os.fdopen(fd, "w") as f:
+    for key, value in values.items():
+        f.write(f"{key}='{value}'\n")

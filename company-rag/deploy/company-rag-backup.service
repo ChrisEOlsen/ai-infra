@@ -1,0 +1,7 @@
+[Unit]
+Description=Verified Company RAG backup
+After=company-rag.service
+[Service]
+Type=oneshot
+ExecStart=/opt/company-rag/ops/backup
+TimeoutStartSec=1800

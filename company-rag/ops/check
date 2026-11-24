@@ -1,0 +1,17 @@
+#!/bin/bash
+set -euo pipefail
+cd "$(dirname "$0")/.."
+python3 -m unittest discover -s tests -p 'test_*.py'
+mvn -B test -f backend/pom.xml
+npm ci --no-audit --no-fund --prefix admin
+npm run build --prefix admin
+if command -v terraform >/dev/null; then
+ terraform fmt -check -recursive terraform
+ terraform -chdir=terraform/aws init -backend=false -input=false
+ terraform -chdir=terraform/aws validate
+ terraform -chdir=terraform/aws test
+ terraform -chdir=terraform/aws/storage init -backend=false -input=false
+ terraform -chdir=terraform/aws/storage validate
+ terraform -chdir=terraform/aws/storage test
+fi
+if [ -f .env ]; then docker compose --env-file .env -f deploy/compose.yml config --quiet; fi

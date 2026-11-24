@@ -1,0 +1,60 @@
+server:
+  forward-headers-strategy: framework
+  servlet:
+    session:
+      timeout: 10m
+      cookie:
+        http-only: true
+        secure: ${COOKIE_SECURE:true}
+        same-site: lax
+spring:
+  datasource:
+    url: ${DATABASE_URL:jdbc:postgresql://postgres:5432/rag}
+    username: rag
+    password: ${RAG_DB_PASSWORD}
+  session:
+    store-type: jdbc
+    jdbc:
+      initialize-schema: always
+  servlet:
+    multipart:
+      max-file-size: 20MB
+      max-request-size: 21MB
+  security:
+    oauth2:
+      client:
+        registration:
+          keycloak:
+            client-id: company-rag
+            client-secret: ${OIDC_CLIENT_SECRET}
+            scope: openid,profile,email,roles
+        provider:
+          keycloak:
+            issuer-uri: ${OIDC_ISSUER}
+management:
+  server:
+    port: 9091
+  endpoints:
+    web:
+      exposure:
+        include: health,metrics
+  endpoint:
+    health:
+      show-details: never
+  otlp:
+    metrics:
+      export:
+        enabled: ${TELEMETRY_ENABLED:false}
+        url: http://alloy:4318/v1/metrics
+        step: 30s
+rag:
+  storage: ${DOCUMENT_STORAGE:/data/documents}
+  api-base: ${MODEL_API_BASE:https://api.openai.com/v1}
+  api-key: ${MODEL_API_KEY:}
+  chat-model: ${CHAT_MODEL:gpt-4.1-mini}
+  embedding-model: ${EMBEDDING_MODEL:text-embedding-3-small}
+  embedding-dimensions: ${EMBEDDING_DIMENSIONS:1536}
+  max-output-tokens: ${MAX_OUTPUT_TOKENS:1200}
+  s3-allowlist: ${S3_ALLOWLIST:}
+  sync-ms: ${SYNC_INTERVAL_MS:300000}
+  mock-model: ${MOCK_MODEL:false}
